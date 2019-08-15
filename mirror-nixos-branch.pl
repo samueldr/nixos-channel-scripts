@@ -20,9 +20,11 @@ my $releaseUrl = $ARGV[1];
 
 die "Usage: $0 CHANNEL-NAME RELEASE-URL\n" unless defined $channelName && defined $releaseUrl;
 
+# Used to allow easier development
+my $withS3 = ($ENV{'WITHOUT_S3'} or "") ne "true";
+
 $channelName =~ /^([a-z]+)-(.*)$/ or die;
 my $channelDirRel = $channelName eq "nixpkgs-unstable" ? "nixpkgs" : "$1/$2";
-
 
 # Configuration.
 my $TMPDIR = $ENV{'TMPDIR'} // "/tmp";
@@ -33,18 +35,21 @@ my $bucketName = "nix-releases";
 $ENV{'GIT_DIR'} = "/home/hydra-mirror/nixpkgs-channels";
 
 
-# S3 setup.
-my $aws_access_key_id = $ENV{'AWS_ACCESS_KEY_ID'} or die;
-my $aws_secret_access_key = $ENV{'AWS_SECRET_ACCESS_KEY'} or die;
+my $bucket;
+if ($withS3) {
+    # S3 setup.
+    my $aws_access_key_id = $ENV{'AWS_ACCESS_KEY_ID'} or die;
+    my $aws_secret_access_key = $ENV{'AWS_SECRET_ACCESS_KEY'} or die;
 
-my $s3 = Net::Amazon::S3->new(
-    { aws_access_key_id     => $aws_access_key_id,
-      aws_secret_access_key => $aws_secret_access_key,
-      retry                 => 1,
-      host                  => "s3-eu-west-1.amazonaws.com",
-    });
+    my $s3 = Net::Amazon::S3->new(
+        { aws_access_key_id     => $aws_access_key_id,
+          aws_secret_access_key => $aws_secret_access_key,
+          retry                 => 1,
+          host                  => "s3-eu-west-1.amazonaws.com",
+        });
 
-my $bucket = $s3->bucket($bucketName) or die;
+    $bucket = $s3->bucket($bucketName) or die;
+}
 
 
 sub fetch {
@@ -73,14 +78,17 @@ my $rev = $evalInfo->{jobsetevalinputs}->{nixpkgs}->{revision} or die;
 print STDERR "release is ‘$releaseName’ (build $releaseId), eval is $evalId, prefix is $releasePrefix, Git commit is $rev\n";
 
 # Guard against the channel going back in time.
-my @curReleaseUrl = split(/\//, read_file("$channelsDir/$channelName", err_mode => 'quiet') // "");
-my $curRelease = pop @curReleaseUrl;
-my $d = `NIX_PATH= nix-instantiate --eval -E "builtins.compareVersions (builtins.parseDrvName \\"$curRelease\\").version (builtins.parseDrvName \\"$releaseName\\").version"`;
-chomp $d;
-die "channel would go back in time from $curRelease to $releaseName, bailing out\n" if $d == 1;
-exit if $d == 0;
+my @previousReleaseUrl = split(/\//, read_file("$channelsDir/$channelName", err_mode => 'quiet') // "");
+my $previousRelease = pop @previousReleaseUrl;
 
-if ($bucket->head_key("$releasePrefix")) {
+if ($previousRelease) {
+    my $d = `NIX_PATH= nix-instantiate --eval -E "builtins.compareVersions (builtins.parseDrvName \\"$previousRelease\\").version (builtins.parseDrvName \\"$releaseName\\").version"`;
+    chomp $d;
+    die "channel would go back in time from $previousRelease to $releaseName, bailing out\n" if $d == 1;
+    exit if $d == 0;
+}
+
+if ($withS3 and $bucket->head_key("$releasePrefix")) {
     print STDERR "release already exists\n";
 } else {
     my $tmpDir = "$TMPDIR/release-$channelName/$releaseName";
@@ -98,20 +106,27 @@ if ($bucket->head_key("$releasePrefix")) {
     sub downloadFile {
         my ($jobName, $dstName) = @_;
 
+        print STDERR "→ Downloading $jobName\n";
+
         my $buildInfo = decode_json(fetch("$evalUrl/job/$jobName", 'application/json'));
 
         my $srcFile = $buildInfo->{buildproducts}->{1}->{path} or die "job '$jobName' lacks a store path";
         $dstName //= basename($srcFile);
         my $dstFile = "$tmpDir/" . $dstName;
 
+        print STDERR "  as $dstName\n";
+
         my $sha256_expected = $buildInfo->{buildproducts}->{1}->{sha256hash} or die;
 
         if (! -e $dstFile) {
-            print STDERR "downloading $srcFile to $dstFile...\n";
+            print STDERR "downloading $srcFile to $dstFile ...\n";
             write_file("$dstFile.sha256", "$sha256_expected  $dstName");
             system("NIX_REMOTE=https://cache.nixos.org/ nix cat-store '$srcFile' > '$dstFile.tmp'") == 0
                 or die "unable to fetch $srcFile\n";
             rename("$dstFile.tmp", $dstFile) or die;
+        }
+        else {
+            print STDERR "  Skipping existing file...\n";
         }
 
         if (-e "$dstFile.sha256") {
@@ -121,10 +136,14 @@ if ($bucket->head_key("$releasePrefix")) {
                 print STDERR "file $dstFile is corrupt $sha256_expected $sha256_actual\n";
                 exit 1;
             }
+            else {
+                print STDERR "  File validated with $sha256_expected.\n";
+            }
         }
     }
 
     if ($channelName =~ /nixos/) {
+        print STDERR ":: Making channel for NixOS\n";
         downloadFile("nixos.channel", "nixexprs.tar.xz");
         downloadFile("nixos.iso_minimal.x86_64-linux");
 
@@ -137,6 +156,7 @@ if ($bucket->head_key("$releasePrefix")) {
         }
 
     } else {
+        print STDERR ":: Making channel for nixpkgs\n";
         downloadFile("tarball", "nixexprs.tar.xz");
     }
 
