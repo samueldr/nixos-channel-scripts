@@ -20,9 +20,6 @@ my $releaseUrl = $ARGV[1];
 
 die "Usage: $0 CHANNEL-NAME RELEASE-URL\n" unless defined $channelName && defined $releaseUrl;
 
-# Used to allow easier development
-my $withS3 = ($ENV{'WITHOUT_S3'} or "") ne "true";
-
 $channelName =~ /^([a-z]+)-(.*)$/ or die;
 my $channelDirRel = $channelName eq "nixpkgs-unstable" ? "nixpkgs" : "$1/$2";
 
@@ -36,7 +33,7 @@ $ENV{'GIT_DIR'} = "/home/hydra-mirror/nixpkgs-channels";
 
 
 my $bucket;
-if ($withS3) {
+if (($ENV{'WITHOUT_S3'} or "") ne "true") {
     # S3 setup.
     my $aws_access_key_id = $ENV{'AWS_ACCESS_KEY_ID'} or die;
     my $aws_secret_access_key = $ENV{'AWS_SECRET_ACCESS_KEY'} or die;
@@ -88,7 +85,7 @@ if ($previousRelease) {
     exit if $d == 0;
 }
 
-if ($withS3 and $bucket->head_key("$releasePrefix")) {
+if ($bucket and $bucket->head_key("$releasePrefix")) {
     print STDERR "release already exists\n";
 } else {
     my $tmpDir = "$TMPDIR/release-$channelName/$releaseName";
@@ -195,12 +192,17 @@ if ($withS3 and $bucket->head_key("$releasePrefix")) {
         my $basename = basename $fn;
         my $key = "$releasePrefix/" . $basename;
 
-        unless (defined $bucket->head_key($key)) {
-            print STDERR "mirroring $fn to s3://$bucketName/$key...\n";
-            $bucket->add_key_filename(
-                $key, $fn,
-                { content_type => $fn =~ /.sha256|src-url|binary-cache-url|git-revision/ ? "text/plain" : "application/octet-stream" })
-                or die $bucket->err . ": " . $bucket->errstr;
+        if ($bucket) {
+            unless (defined $bucket->head_key($key)) {
+                print STDERR "mirroring $fn to s3://$bucketName/$key...\n";
+                $bucket->add_key_filename(
+                    $key, $fn,
+                    { content_type => $fn =~ /.sha256|src-url|binary-cache-url|git-revision/ ? "text/plain" : "application/octet-stream" })
+                    or die $bucket->err . ": " . $bucket->errstr;
+            }
+        }
+        else {
+            print STDERR "[DEV] Skipping mirroring $fn ...\n";
         }
 
         next if $basename =~ /.sha256$/;
@@ -216,11 +218,17 @@ if ($withS3 and $bucket->head_key("$releasePrefix")) {
 
     $html .= "</tbody></table></body></html>";
 
-    $bucket->add_key($releasePrefix, $html,
-                     { content_type => "text/html" })
-        or die $bucket->err . ": " . $bucket->errstr;
+    if ($bucket) {
+        $bucket->add_key($releasePrefix, $html,
+            { content_type => "text/html" })
+            or die $bucket->err . ": " . $bucket->errstr;
 
-    File::Path::remove_tree($tmpDir);
+        File::Path::remove_tree($tmpDir);
+    }
+    else {
+        print STDERR "[DEV] Keeping $tmpDir around instead of removing\n.";
+        write_file("$tmpDir/index.html",$html);
+    }
 }
 
 # Prevent concurrent writes to the channels directory.
