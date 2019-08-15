@@ -161,6 +161,7 @@ if ($bucket and $bucket->head_key("$releasePrefix")) {
     # nixexprs.tar.xz. Also maintain the debug info repository at
     # https://cache.nixos.org/debuginfo.
     if ($channelName =~ /nixos/ && -e "$tmpDir/store-paths") {
+        print STDERR ":: Generating programs.sqlite\n";
         File::Path::make_path("$tmpDir/unpack");
         system("tar", "xfJ", "$tmpDir/nixexprs.tar.xz", "-C", "$tmpDir/unpack") == 0 or die;
         my $exprDir = glob("$tmpDir/unpack/*");
@@ -173,9 +174,11 @@ if ($bucket and $bucket->head_key("$releasePrefix")) {
     }
 
     if (-e "$tmpDir/store-paths") {
+        print STDERR ":: Compressing store-paths\n";
         system("xz", "$tmpDir/store-paths") == 0 or die;
     }
 
+    print STDERR ":: Uploading to S3 and building index.html\n";
     my $now = strftime("%F %T", localtime);
     my $title = "$channelName release $releaseName";
     my $githubLink = "https://github.com/NixOS/nixpkgs-channels/commits/$rev";
@@ -232,6 +235,7 @@ if ($bucket and $bucket->head_key("$releasePrefix")) {
 }
 
 # Prevent concurrent writes to the channels directory.
+print STDERR ":: Making HTTP redirects\n";
 open(my $lockfile, ">>", "$channelsDir/.htaccess.lock");
 flock($lockfile, LOCK_EX) or die "cannot acquire channels lock\n";
 
@@ -252,6 +256,7 @@ system("cat $channelsDir/.htaccess-nix* > $channelsDir/.htaccess.tmp") == 0 or d
 rename("$channelsDir/.htaccess.tmp", "$channelsDir/.htaccess") or die;
 
 # Update the nixpkgs-channels repo.
+print STDERR ":: Updating nixpkgs-channels repository\n";
 system("git remote update origin >&2") == 0 or die;
 system("git push channels $rev:refs/heads/$channelName >&2") == 0 or die;
 
