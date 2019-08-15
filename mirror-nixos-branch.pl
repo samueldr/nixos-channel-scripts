@@ -50,13 +50,18 @@ if (($ENV{'WITHOUT_S3'} or "") ne "true") {
 
 
 sub fetch {
-    my ($url, $type) = @_;
+    my ($url, $type, $dontfail) = @_;
 
     my $ua = LWP::UserAgent->new;
     $ua->default_header('Accept', $type) if defined $type;
 
     my $response = $ua->get($url);
-    die "could not download $url: ", $response->status_line, "\n" unless $response->is_success;
+    if ($dontfail) {
+        return;
+    }
+    else {
+        die "could not download $url: ", $response->status_line, "\n" unless $response->is_success;
+    }
 
     return $response->decoded_content;
 }
@@ -100,6 +105,36 @@ if ($bucket and $bucket->head_key("$releasePrefix")) {
         write_file("$tmpDir/store-paths", join("\n", uniq(@{$storePaths})) . "\n");
     }
 
+    sub getManifest {
+        # This either uses a fixed manifest (for pre-19.09 channels) or
+        # downloads the manifest file from the channel.
+        my $rawBuildInfo = fetch("$evalUrl/job/_manifest", 'application/json', 1);
+        unless ($rawBuildInfo) {
+            print STDERR "→ Using fixed pre-19.09 manifest\n";
+            my %manifest;
+            if ($channelName =~ /nixos/) {
+                $manifest{"nixos.channel"} = "nixexprs.tar.xz";
+                $manifest{"nixos.iso_minimal.x86_64-linux"} = undef;
+
+                if ($channelName !~ /-small/) {
+                    $manifest{"nixos.iso_minimal.i686-linux"} = undef;
+                    $manifest{"nixos.iso_graphical.x86_64-linux"} = undef;
+                    $manifest{"nixos.ova.x86_64-linux"} = undef;
+                }
+
+            } else {
+                $manifest{"tarball"} = "nixexprs.tar.xz";
+            }
+
+            return %manifest;
+        }
+
+        print STDERR "→ Found 19.09-style manifest\n";
+        my $buildInfo = decode_json($rawBuildInfo);
+
+        return decode_json(read_file($buildInfo->{buildoutputs}->{out}->{path}));
+    }
+
     sub downloadFile {
         my ($jobName, $dstName) = @_;
 
@@ -139,22 +174,12 @@ if ($bucket and $bucket->head_key("$releasePrefix")) {
         }
     }
 
-    if ($channelName =~ /nixos/) {
-        print STDERR ":: Making channel for NixOS\n";
-        downloadFile("nixos.channel", "nixexprs.tar.xz");
-        downloadFile("nixos.iso_minimal.x86_64-linux");
+    print STDERR ":: Getting manifest\n";
+    my %manifest = getManifest();
 
-        if ($channelName !~ /-small/) {
-            downloadFile("nixos.iso_minimal.i686-linux");
-            downloadFile("nixos.iso_graphical.x86_64-linux");
-            #downloadFile("nixos.iso_graphical.i686-linux");
-            downloadFile("nixos.ova.x86_64-linux");
-            #downloadFile("nixos.ova.i686-linux");
-        }
-
-    } else {
-        print STDERR ":: Making channel for nixpkgs\n";
-        downloadFile("tarball", "nixexprs.tar.xz");
+    print STDERR ":: Downloading manifest contents\n";
+    for my $attr (keys %manifest) {
+        downloadFile($attr, $manifest{$attr});
     }
 
     # Generate the programs.sqlite database and put it in
